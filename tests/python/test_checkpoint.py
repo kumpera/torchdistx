@@ -6,6 +6,8 @@ import torch.nn
 
 from torchdistx.checkpoint.state_dict_loader import  validate_metadata
 from torchdistx.checkpoint.state_dict_saver import _prepare
+from torchdistx.checkpoint.metadata import Metadata
+
 from torch.distributed._shard import sharded_tensor
 from torch.distributed._shard.sharded_tensor import (
     state_dict_hook,
@@ -53,6 +55,7 @@ class TestCheckpointing(ShardedTensorTestBase):
     @requires_nccl()
     def test_validate_metadata(self) -> None:
         module = TestModule()
+        
         # compute the default saved metadata (must pass always_add_tensors or we'll get incomplete MD)
         metadata, _, _, _ = _prepare(module.state_dict(), always_add_tensors=True)
         self.assertTrue(
@@ -112,3 +115,31 @@ class TestCheckpointing(ShardedTensorTestBase):
                 "regular" not in metadata.state_dict_metadata,
                 f"keys: {metadata.state_dict_metadata.keys()}",
             )
+
+
+    def gen_metadata(self) -> Metadata:
+        module = TestModule()
+        # compute the default saved metadata (must pass always_add_tensors or we'll get incomplete MD)
+        metadata, _, _, _ = _prepare(module.state_dict(), always_add_tensors=True)
+        return metadata
+
+    @with_comms(init_rpc=False)
+    @skip_if_lt_x_gpu(2)
+    # pyre-fixme [56]: Pyre was not able to infer the type of the decorator `torch.testing._internal.common_distributed.requires_nccl()`
+    @requires_nccl()
+    def test_checkpint_has_shard_too_small(self) -> None:
+        metadata = self.gen_metadata()
+        
+        #we make the first stored shard smaller
+        self.assertTrue(
+            ".sharded" in metadata.state_dict_metadata, 
+            f"keys: {metadata.state_dict_metadata.keys()}"
+        )
+
+        sizes = metadata.state_dict_metadata['.sharded'].storage_metadata[0].shard_metadata.shard_sizes
+        for i in range(len(sizes)):
+            sizes[i] = 1
+        
+        module = TestModule()
+        self.assertIsNotNone(validate_metadata(module.state_dict(), metadata))
+    

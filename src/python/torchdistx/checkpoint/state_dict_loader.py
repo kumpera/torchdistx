@@ -4,14 +4,24 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.distributed._shard.sharded_tensor import (
     ShardedTensor,
+    ShardedTensorMetadata,
+)
+
+from torch.distributed._shard.sharding_spec._internals import (
+    validate_non_overlapping_shards_metadata,
 )
 
 from .metadata import (
     BytesReadRequest,
     TensorReadRequest,
     Metadata,
+    ExtendedTensorMetadata,
 )
-from .resharding import prepare_sharded_tensor_read
+from .resharding import (
+    prepare_sharded_tensor_read,
+    _check_shard_metadata_pair_overlap,
+    _shards_get_overlap_region_wrt_saved_tensor
+)
 from .storage_reader import StorageReader
 
 
@@ -121,6 +131,52 @@ def load_state_dict(
 
     tensor_futures.wait()
 
+def _validate_sharded_tensor(tensor_md: ShardedTensorMetadata, checkpoint_md: ExtendedTensorMetadata) -> None:
+    # We assume the incoming tensor has being validated during construction
+
+    res = []
+    #To ensure a checkpoint can satisfy loading a ST, we compute the loading plans for all shards and see if they are doable.
+    try:
+        #this API returns a list of issues
+        validate_non_overlapping_shards_metadata(checkpoint_md.tensor_metadata.shards_metadata)
+    except ValueError as e:
+        res.append(str(e))
+
+    for shard_md in tensor_md.shards_metadata:
+        read_volume = 0
+        for storage_md in checkpoint_md.storage_metadata:
+            shard_md_from_storage = storage_md.shard_metadata
+            assert shard_md_from_storage is not None
+            # this is a naive quadratic algo that can later be optimized by sorting metadata and the shards md
+            # FIXME what does it mean for offset > 0? just add it to read request offset?
+            assert (
+                storage_md.offset == 0
+            ), f"Storage at key {storage_md.storage_key} is saved with an offset, we cannot load this yet"
+
+            # do they overlap?
+            if not _check_shard_metadata_pair_overlap(
+                shard_md, shard_md_from_storage
+            ):
+                continue
+
+            shard_volume = 1
+            for (
+                _,
+                _,
+                _,
+                length,
+            ) in _shards_get_overlap_region_wrt_saved_tensor(
+                saved_shard=shard_md_from_storage, current_shard=shard_md
+            ):
+                shard_volume *= length
+            read_volume += shard_volume
+        
+        shard_volume = 1
+        for size in shard_md.shard_sizes:
+            shard_volume *= size
+        if read_volume != shard_volume:
+            res.append(f"Shard {shard_md} only has {read_volume} available elements but needs {shard_volume}")
+    return res
 
 def validate_metadata(
     state_dict: Dict[str, Any], metadata: Metadata
@@ -149,9 +205,6 @@ def validate_metadata(
         if isinstance(obj, torch.Tensor):
             if fqn not in metadata.state_dict_metadata:
                 res.append(f"{fqn}: Could not find Tensor metadata")
-                # print(type(fqn))
-                # print(metadata.state_dict_metadata)
-                # print(metadata.state_dict_metadata[fqn])
                 continue
             md = metadata.state_dict_metadata[fqn]
             md_size = list(md.tensor_metadata.size)
@@ -172,5 +225,6 @@ def validate_metadata(
                 res.append(
                     f"{fqn}: Incompatible ShardedTensor size: expectected {tensor_size} but found {md_size}"
                 )
+            res += _validate_sharded_tensor(obj.metadata(), md)
 
     return res if len(res) > 0 else None
