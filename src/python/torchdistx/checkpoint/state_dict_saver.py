@@ -7,22 +7,22 @@ from torch import Tensor
 from torch.distributed._shard.sharded_tensor import (
     ShardedTensor,
     ShardedTensorMetadata,
-    ShardMetadata,
     TensorProperties,
+    ShardMetadata,
 )
 
 from .metadata import (
+    Metadata,
     BytesWriteRequest,
     ExtendedTensorMetadata,
-    Metadata,
     StorageMetadata,
     TensorWriteRequest,
 )
+from .resharding import prepare_sharded_tensor_write
 from .storage_writer import StorageWriter
 
-
 # -------------- private functions --------------
-def _compute_tensor_md(fqn: str, tensor: Tensor, metadata: Metadata) -> None:
+def _compute_tensor_md(fqn: str, tensor: Tensor) -> ExtendedTensorMetadata:
     # --- Step 3, populate the metadata ---
     #
     # Since torch.Tensor does not have a standard set of metadata we can operate on
@@ -51,7 +51,7 @@ def _compute_tensor_md(fqn: str, tensor: Tensor, metadata: Metadata) -> None:
         ),
     )
 
-    etmd = ExtendedTensorMetadata(
+    return ExtendedTensorMetadata(
         tensor_metadata=stm,
         storage_metadata=[
             StorageMetadata(
@@ -62,95 +62,10 @@ def _compute_tensor_md(fqn: str, tensor: Tensor, metadata: Metadata) -> None:
             )
         ],
     )
-    metadata.state_dict_metadata[fqn] = etmd
-
-
-def _compute_sharded_tensor_md(
-    fqn: str, tensor: ShardedTensor, metadata: Metadata
-) -> None:
-    smd = []
-    for shard_md in tensor.metadata().shards_metadata:
-        # each shard is in it own storage key.
-        # Most network file system is optimized with single write, multiple read
-        # Unless we can group tensors locally into one big chunk
-        # It might be best to write each shard as one key
-        suffix = "_".join([str(i) for i in shard_md.shard_offsets])
-        storage_key = f"{fqn}_{suffix}"
-
-        shard_size = 1
-        for d in shard_md.shard_sizes:
-            shard_size *= d
-
-        # not particularly great
-        storage_size = shard_size * tensor.local_shards()[0].tensor.element_size()
-
-        one_smd = StorageMetadata(
-            shard_metadata=shard_md,
-            storage_key=storage_key,
-            length=storage_size,
-            offset=0,
-        )
-        smd.append(one_smd)
-
-    etmd = ExtendedTensorMetadata(
-        tensor_metadata=tensor.metadata(),
-        storage_metadata=smd,
-    )
-    metadata.state_dict_metadata[fqn] = etmd
-
-
-def _populate_inplace_with_a_tensor(
-    fqn: str,
-    tensor: Tensor,
-    size_for_storage_keys: Dict[str, int],
-    write_requests: List[TensorWriteRequest],
-) -> None:
-    # --- Step 1, populate write request ---
-    tensor = tensor.detach()
-    storage_size = tensor.nelement() * tensor.element_size()
-
-    wr = TensorWriteRequest(
-        tensor=tensor,
-        storage_key=fqn,
-    )
-
-    write_requests.append(wr)
-
-    # --- Step 2, populate the size_for_storage_keys ---
-    #
-    size_for_storage_keys[fqn] = storage_size
-
-
-def _populate_inplace_with_a_sharded_tensor(
-    fqn: str,
-    sharded_tensor: ShardedTensor,
-    size_for_storage_keys: Dict[str, int],
-    write_requests: List[TensorWriteRequest],
-) -> None:
-    for shard in sharded_tensor.local_shards():
-        # each shard has its own storage key.
-        # For most cases, the read is a recovery from a failure to the same sharding
-        # and does not need any resharding, write each shard as is is the most effective
-        suffix = "_".join([str(i) for i in shard.metadata.shard_offsets])
-        storage_key = f"{fqn}_{suffix}"
-
-        tensor = shard.tensor.detach()
-        storage_size = tensor.nelement() * tensor.element_size()
-
-        assert (
-            storage_key not in size_for_storage_keys
-        ), "storage key must be unique per state_dict!"
-        size_for_storage_keys[storage_key] = storage_size
-
-        wr = TensorWriteRequest(
-            tensor=tensor,
-            storage_key=storage_key,
-        )
-        write_requests.append(wr)
 
 
 def _prepare(
-    state_dict: Dict[str, Any]
+    state_dict: Dict[str, Any], always_add_tensors: bool = False
 ) -> Tuple[Metadata, Dict[str, int], List[BytesWriteRequest], List[TensorWriteRequest]]:
     """
     Uses the state_dict to build three things.
@@ -171,30 +86,37 @@ def _prepare(
 
     Subclasses can optionally overwrite the implementation here,
     if the default does not meet its requirement.
+    Args:
+        state_dict: The state_dict to operate on
+        always_add_tensors: Include non-sharded tensors even if rank != 0
     """
     metadata = Metadata(state_dict_metadata={})
-    storage_keys: Dict[str, int] = {}
     tensor_write_requests: List[TensorWriteRequest] = []
     bytes_write_requests: List[BytesWriteRequest] = []
 
     for fqn, obj in state_dict.items():
         if isinstance(obj, Tensor):
-            # The assumption is that non ShardedTensors are full replicated across
-            # all ranks so we just need one from Rank 0.
+            # The assumption is that non ShardedTensors are full replicated across all ranks
+            # So we just need one from Rank 0.
             # If that's not the case, we will update later.
-            if dist.is_initialized() and dist.get_rank() != 0:
+            if (
+                not always_add_tensors
+                and dist.is_initialized()
+                and dist.get_rank() != 0
+            ):
                 pass
             else:
-                _populate_inplace_with_a_tensor(
-                    fqn, obj, storage_keys, tensor_write_requests
+                tensor_write_requests.append(
+                    TensorWriteRequest(
+                        tensor=obj.detach(),
+                        storage_key=fqn,
+                    )
                 )
-                _compute_tensor_md(fqn, obj, metadata)
+                metadata.state_dict_metadata[fqn] = _compute_tensor_md(fqn, obj)
         elif isinstance(obj, ShardedTensor):
-            _populate_inplace_with_a_sharded_tensor(
-                fqn, obj, storage_keys, tensor_write_requests
-            )
-            _compute_sharded_tensor_md(fqn, obj, metadata)
-
+            write_reqs, md = prepare_sharded_tensor_write(obj, fqn)
+            tensor_write_requests += write_reqs
+            metadata.state_dict_metadata[fqn] = md
         else:
             bytes_io = io.BytesIO()
             torch.save(obj, bytes_io)
@@ -203,6 +125,11 @@ def _prepare(
                 storage_key=fqn,
             )
             bytes_write_requests.append(bwr)
+
+    storage_keys: Dict[str, int] = {
+        req.storage_key: req.tensor.nelement() * req.tensor.element_size()
+        for req in tensor_write_requests
+    }
 
     return (metadata, storage_keys, bytes_write_requests, tensor_write_requests)
 
@@ -213,11 +140,9 @@ def save_state_dict(
 ) -> None:
     """
     This public function defined the default behavior to save a state_dict
-
-    NB:
-    1. The saved format still a prototype.
-    2. We don't guarantee backward compatibility yet.
-    3. The caller needs to ensure the correctness of the state_dict.
+    Notes
+    1. This is a WIP, the state_dict save with different versions of the code might not be compatible.
+    2. The caller needs to ensure the correctness of the state_dict
 
     Sample Code
     ```
@@ -229,17 +154,17 @@ def save_state_dict(
         optim_state_dict = optimizer.state_dict()
 
         ...
-        # torchdistx.checkpoint does not assume the the correctness of the state_dict
+        # torch.distributed does not assume the the correctness of the state_dict
         # the caller needs to ensure the correctness of the state_dict
         optim_state_dict = some_function_to_cleanup_optim_state_dict(optim_state_dict)
         ...
 
-        fs_storage_writer = torchdistx.checkpoint.FileSystemWriter("/checkpoint/1")
-        torchdistx.checkpoint.save_state_dict(
+        fs_storage_writer = torch.distributed.FileSystemWriter("/checkpoint/1")
+        torch.distributed.save_state_dict(
             state_dict=model_state_dict,
             storage_writer=fs_stroage_writer,
         )
-        torchdistx.checkpoint.save_state_dict(
+        torch.distributed.save_state_dict(
             state_dict=optim_state_dict,
             storage_writer=fs_stroage_writer,
         )
@@ -248,7 +173,7 @@ def save_state_dict(
 
     Args:
         state_dict (Dict[str, Any]) : A state_dict
-        storage_writer (StorageWriter): A StorageWriter that performs the writes.
+        storage_writer (StorageWriter): An instance of storage writer that performance the writes.
     """
     (
         metadata,

@@ -7,20 +7,26 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed._shard import sharded_tensor
-from torch.distributed._shard.sharded_tensor import (ShardedTensor,
-                                                     state_dict_hook)
-from torch.distributed._shard.sharding_spec import (ChunkShardingSpec,
-                                                    EnumerableShardingSpec,
-                                                    ShardingSpec,
-                                                    ShardMetadata)
-from torch.testing._internal.common_distributed import (requires_nccl,
-                                                        skip_if_lt_x_gpu)
+from torch.distributed._shard.sharded_tensor import ShardedTensor, state_dict_hook
+from torch.distributed._shard.sharding_spec import (
+    ChunkShardingSpec,
+    EnumerableShardingSpec,
+    ShardingSpec,
+    ShardMetadata,
+)
+from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.distributed._shard.sharded_tensor import (
-    ShardedTensorTestBase, with_comms)
+    ShardedTensorTestBase,
+    with_comms,
+)
 
-from torchdistx.checkpoint import (FileSystemReader, FileSystemWriter,
-                                   load_state_dict, save_state_dict)
+from torchdistx.checkpoint import (
+    FileSystemReader,
+    FileSystemWriter,
+    load_state_dict,
+    save_state_dict,
+)
 
 
 def assert_state_dict_equal(
@@ -139,7 +145,7 @@ class TestStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    @with_comms(init_rpc=True)
+    @with_comms(init_rpc=False)
     @skip_if_lt_x_gpu(2)
     # pyre-fixme [56]: Pyre was not able to infer the type of the decorator `torch.testing._internal.common_distributed.requires_nccl()`
     @requires_nccl()
@@ -204,7 +210,7 @@ class TestReshardOnLoad(ShardedTensorTestBase):
         tensor.gather(out=res)
         return cast(Tensor, res)
 
-    @with_comms(init_rpc=True)
+    @with_comms(init_rpc=False)
     @skip_if_lt_x_gpu(2)
     # pyre-fixme [56]: Pyre was not able to infer the type of the decorator `torch.testing._internal.common_distributed.requires_nccl()`
     @requires_nccl()
@@ -282,8 +288,9 @@ class TestReshardOnLoad(ShardedTensorTestBase):
                 if s0 == s1:
                     continue
 
-                shutil.rmtree(path, ignore_errors=True)
-                os.makedirs(path)
+                if dist.get_rank() == 0:
+                    shutil.rmtree(path, ignore_errors=True)
+                    os.makedirs(path)
                 dist.barrier()
 
                 model_to_save = MyShardedModel3(s0)
@@ -315,7 +322,7 @@ class TestReshardOnLoad(ShardedTensorTestBase):
                         torch.allclose(store_tensor, load_tensor), msg=f"{s0} vs {s1}"
                     )
 
-    @with_comms(init_rpc=True)
+    @with_comms(init_rpc=False)
     @skip_if_lt_x_gpu(2)
     # pyre-fixme [56]: Pyre was not able to infer the type of the decorator `torch.testing._internal.common_distributed.requires_nccl()`
     @requires_nccl()
